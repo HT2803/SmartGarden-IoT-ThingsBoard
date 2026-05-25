@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hệ Thống Vườn Thông Minh IoT</title>
+    <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @keyframes pulseScale {
+            0%, 100% { transform: scale(1); }
+            50% { transform: scale(1.05); }
+        }
+        .animate-pulse-scale {
+            animation: pulseScale 1.5s infinite ease-in-out;
+        }
+    </style>
+</head>
+<body class="bg-gray-100 min-h-screen">
+
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const TB_BASE_URL = "https://thingsboard.cloud/api";
+        const DEVICE_ID = "b162a250-5808-11f1-aa03-0f0d95b4aecc"; 
+
+        function App() {
+            const [isLoggedIn, setIsLoggedIn] = React.useState(false);
+            const [username, setUsername] = React.useState('');
+            const [password, setPassword] = React.useState('');
+            const [userRole, setUserRole] = React.useState('Guest'); 
+            const [token, setToken] = React.useState('');
+            const [errorMsg, setErrorMsg] = React.useState('');
+
+            const [telemetry, setTelemetry] = React.useState({
+                temperature: 0,
+                humidity: 0,
+                lux: 0,         
+                soilPercent: 0  
+            });
+
+            const [showSoilModal, setShowSoilModal] = React.useState(false);
+            const [lastSoilStatus, setLastSoilStatus] = React.useState(false); 
+
+            const handleLogin = async (e) => {
+                e.preventDefault();
+                setErrorMsg('');
+
+                if (username === 'guest') {
+                    setErrorMsg('');
+                    try {
+                        const response = await fetch(`${TB_BASE_URL}/auth/login`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ 
+                                username: 'thm048048@gmail.com', 
+                                password: '123456789H' 
+                            })
+                        });
+                        if (response.ok) {
+                            const data = await response.json();
+                            setToken(data.token);
+                            setIsLoggedIn(true);
+                            setUserRole('Guest'); 
+                            return;
+                        } else {
+                            throw new Error();
+                        }
+                    } catch(err) {
+                        setErrorMsg('Lỗi kích hoạt tài khoản khách!');
+                        return;
+                    }
+                }
+
+                try {
+                    const response = await fetch(`${TB_BASE_URL}/auth/login`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ username, password })
+                    });
+
+                    if (!response.ok) throw new Error('Sai tài khoản hoặc mật khẩu!');
+
+                    const data = await response.json();
+                    setToken(data.token); 
+                    setIsLoggedIn(true);
+
+                    if (username.includes('admin')) {
+                        setUserRole('Admin');
+                    } else {
+                        setUserRole('User');
+                    }
+                } catch (err) {
+                    setError
