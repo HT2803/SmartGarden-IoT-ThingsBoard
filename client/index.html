@@ -19,7 +19,6 @@
     </style>
 </head>
 <body class="bg-gray-100 min-h-screen">
-
     <div id="root"></div>
 
     <script type="text/babel">
@@ -30,20 +29,132 @@
             const [isLoggedIn, setIsLoggedIn] = React.useState(false);
             const [username, setUsername] = React.useState('');
             const [password, setPassword] = React.useState('');
-            const [userRole, setUserRole] = React.useState('Guest'); 
+            const [userRole, setUserRole] = React.useState('Guest');
             const [token, setToken] = React.useState('');
             const [errorMsg, setErrorMsg] = React.useState('');
 
             const [telemetry, setTelemetry] = React.useState({
                 temperature: 0,
                 humidity: 0,
-                lux: 0,         
-                soilPercent: 0  
+                lux: 0,
+                soilPercent: 0
             });
 
             const [ledState, setLedState] = React.useState(false);
+            const [manualControl, setManualControl] = React.useState(false);
             const [showSoilModal, setShowSoilModal] = React.useState(false);
             const [lastSoilStatus, setLastSoilStatus] = React.useState(false);
+            const [rpcResult, setRpcResult] = React.useState('');
+            const [sending, setSending] = React.useState(false);
+
+            const handleTelemetryData = (data) => {
+                if (data.ledState !== undefined) {
+                    setLedState(data.ledState == 1 || data.ledState == true || data.ledState == "ON");
+                }
+                if (data.manualControl !== undefined) {
+                    setManualControl(data.manualControl == 1 || data.manualControl == true);
+                }
+                setTelemetry(prev => {
+                    const currentSoilPercent = data.soilPercent !== undefined ? parseFloat(data.soilPercent).toFixed(1) : prev.soilPercent;
+                    const isDryNow = parseFloat(currentSoilPercent) < 30.0;
+
+                    if (isDryNow && !lastSoilStatus) setShowSoilModal(true);
+                    if (!isDryNow) setShowSoilModal(false);
+                    setLastSoilStatus(isDryNow);
+
+                    return {
+                        temperature: data.temperature !== undefined ? parseFloat(data.temperature).toFixed(1) : prev.temperature,
+                        humidity: data.humidity !== undefined ? parseFloat(data.humidity).toFixed(1) : prev.humidity,
+                        lux: data.lux !== undefined ? parseFloat(data.lux).toFixed(1) : prev.lux,
+                        soilPercent: currentSoilPercent
+                    };
+                });
+            };
+
+            React.useEffect(() => {
+                if (!isLoggedIn) return;
+
+                const fetchTelemetry = async () => {
+                    try {
+                        const headers = {};
+                        if (token && token !== 'bypass-cors-token') {
+                            headers['X-Authorization'] = `Bearer ${token}`;
+                        }
+                        const response = await fetch(
+                            `${TB_BASE_URL}/plugins/telemetry/DEVICE/${DEVICE_ID}/values/timeseries`,
+                            { headers }
+                        );
+                        if (response.ok) {
+                            const data = await response.json();
+                            handleTelemetryData({
+                                temperature: data.temperature?.[0]?.value,
+                                humidity: data.humidity?.[0]?.value,
+                                lux: data.lux?.[0]?.value,
+                                soilPercent: data.soilPercent?.[0]?.value,
+                                ledState: data.ledState?.[0]?.value,
+                                manualControl: data.manualControl?.[0]?.value
+                            });
+                        }
+                    } catch (err) {
+                        console.error(err);
+                    }
+                };
+
+                fetchTelemetry();
+                const interval = setInterval(fetchTelemetry, 2000);
+                return () => clearInterval(interval);
+            }, [isLoggedIn, token]);
+
+            // ✅ Gửi lệnh RPC qua REST API thay vì MQTT
+            const sendRpcCommand = async (method, params, successMsg) => {
+                if (userRole === 'Guest') return;
+                if (!token || token === 'bypass-cors-token') {
+                    setRpcResult('❌ Cần đăng nhập bằng tài khoản Admin hợp lệ');
+                    return;
+                }
+
+                setSending(true);
+                setRpcResult('⏳ Đang gửi lệnh...');
+
+                try {
+                    const response = await fetch(
+                        `${TB_BASE_URL}/plugins/rpc/twoway/${DEVICE_ID}`,
+                        {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'X-Authorization': `Bearer ${token}`
+                            },
+                            body: JSON.stringify({ method, params, timeout: 5000 })
+                        }
+                    );
+
+                    if (response.ok) {
+                        setRpcResult(successMsg);
+                    } else {
+                        const errText = await response.text();
+                        console.error('RPC error:', errText);
+                        setRpcResult('❌ Lỗi gửi lệnh (' + response.status + ')');
+                    }
+                } catch (err) {
+                    setRpcResult('❌ Lỗi mạng: ' + err.message);
+                } finally {
+                    setSending(false);
+                    setTimeout(() => setRpcResult(''), 3000);
+                }
+            };
+
+            const toggleLed = async () => {
+                const newState = !ledState;
+                setLedState(newState);
+                setManualControl(true);
+                await sendRpcCommand("setLedState", { state: newState }, '✅ Đã bật/tắt đèn thành công');
+            };
+
+            const setAutoMode = async () => {
+                setManualControl(false);
+                await sendRpcCommand("setLedMode", { mode: "auto" }, '🔄 Đã về Tự động');
+            };
 
             const handleLogin = async (e) => {
                 e.preventDefault();
@@ -52,7 +163,7 @@
                 if (username === 'guest') {
                     setIsLoggedIn(true);
                     setUserRole('Guest');
-                    setToken('public-access-no-token');
+                    setToken('');
                     return;
                 }
 
@@ -63,19 +174,16 @@
                         body: JSON.stringify({ username, password })
                     });
 
-                    if (!response.ok) throw new Error('Sai tài khoản hoặc mật khẩu!');
-
-                    const data = await response.json();
-                    setToken(data.token); 
-                    setIsLoggedIn(true);
-
-                    if (username.includes('admin')) {
+                    if (response.ok) {
+                        const data = await response.json();
+                        setToken(data.token);
+                        setIsLoggedIn(true);
                         setUserRole('Admin');
                     } else {
-                        setUserRole('User');
+                        setErrorMsg('Sai tài khoản hoặc mật khẩu!');
                     }
                 } catch (err) {
-                    setErrorMsg(err.message || 'Lỗi kết nối server!');
+                    setErrorMsg('Lỗi kết nối đến ThingsBoard: ' + err.message);
                 }
             };
 
@@ -86,57 +194,8 @@
                 setUsername('');
                 setPassword('');
                 setShowSoilModal(false);
+                setRpcResult('');
             };
-
-            React.useEffect(() => {
-                if (!isLoggedIn) return;
-
-                const fetchTelemetry = async () => {
-                    try {
-                        const headers = {};
-                        if (userRole !== 'Guest') {
-                            headers['Authorization'] = `Bearer ${token}`;
-                        }
-
-                        const response = await fetch(
-                            `${TB_BASE_URL}/plugins/telemetry/DEVICE/${DEVICE_ID}/values/timeseries`,
-                            { headers }
-                        );
-                        
-                        if (response.ok) {
-                            const data = await response.json();
-                            
-                            const currentSoilPercent = (100.0 - parseFloat(data.soilPercent?.[0]?.value || 0)).toFixed(1);
-                            const isDryNow = parseFloat(currentSoilPercent) < 30.0;
-
-                            setTelemetry({
-                                temperature: parseFloat(data.temperature?.[0]?.value || 0).toFixed(1),
-                                humidity: parseFloat(data.humidity?.[0]?.value || 0).toFixed(1),
-                                lux: parseFloat(data.lux?.[0]?.value || 0).toFixed(1),
-                                soilPercent: currentSoilPercent
-                            });
-
-                            const currentLed = data.ledState?.[0]?.value;
-                            setLedState(currentLed == "1" || currentLed == "true" || currentLed == true || currentLed == "ON");
-
-                            if (isDryNow && !lastSoilStatus) {
-                                setShowSoilModal(true);
-                            }
-                            if (!isDryNow) {
-                                setShowSoilModal(false);
-                            }
-                            
-                            setLastSoilStatus(isDryNow);
-                        }
-                    } catch (err) {
-                        console.error("Lỗi lấy dữ liệu cảm biến:", err);
-                    }
-                };
-
-                fetchTelemetry();
-                const interval = setInterval(fetchTelemetry, 2000); 
-                return () => clearInterval(interval);
-            }, [isLoggedIn, token, userRole, lastSoilStatus]);
 
             if (!isLoggedIn) {
                 return (
@@ -146,72 +205,105 @@
                         <form onSubmit={handleLogin} class="space-y-4">
                             <div>
                                 <label class="block text-sm font-medium text-gray-700">Tài khoản:</label>
-                                <input type="text" value={username} onChange={(e) => setUsername(e.target.value)} required class="w-full mt-1 p-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-green-500 focus:outline-none" placeholder="admin@gmail.com / user@gmail.com / guest" />
+                                <input type="text" value={username} onChange={(e) => setUsername(e.target.value)} required class="w-full mt-1 p-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-green-500 focus:outline-none" placeholder="Email ThingsBoard hoặc guest" />
                             </div>
                             <div>
                                 <label class="block text-sm font-medium text-gray-700">Mật khẩu:</label>
-                                <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} class="w-full mt-1 p-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-green-500 focus:outline-none" placeholder="Bỏ trống nếu là guest" />
+                                <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} class="w-full mt-1 p-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-green-500 focus:outline-none" placeholder="Mật khẩu ThingsBoard (guest bỏ trống)" />
                             </div>
                             {errorMsg && <p class="text-red-500 text-sm font-semibold">{errorMsg}</p>}
                             <button type="submit" class="w-full py-2 bg-green-700 text-white font-bold rounded-md hover:bg-green-800 transition duration-200">ĐĂNG NHẬP</button>
                         </form>
+                        <p class="text-center text-xs text-gray-400 mt-4">Nhập <b>guest</b> để xem thông số (không điều khiển được)</p>
                     </div>
                 );
             }
 
             return (
                 <div class="max-w-4xl mx-auto p-6 font-sans relative">
-                    
+
                     {showSoilModal && (
-                        <div class="mb-6 p-4 bg-red-100 border-2 border-red-400 rounded-xl shadow-md flex justify-between items-center animate-pulse-scale transition duration-300">
+                        <div class="mb-6 p-4 bg-red-100 border-2 border-red-400 rounded-xl shadow-md flex justify-between items-center animate-pulse-scale">
                             <div class="flex items-center space-x-3">
                                 <span class="text-2xl">⚠️</span>
                                 <div>
                                     <h4 class="font-bold text-red-800 text-base">CẢNH BÁO HỆ THỐNG</h4>
-                                    <p class="text-sm text-red-700 font-semibold">ĐẤT KHÔ! CẦN TƯỚI NGAY (Độ ẩm hiện tại: {telemetry.soilPercent}%)</p>
+                                    <p class="text-sm text-red-700 font-semibold">ĐẤT KHÔ! CẦN TƯỚI NGAY (Độ ẩm: {telemetry.soilPercent}%)</p>
                                 </div>
                             </div>
-                            <button 
-                                onClick={() => setShowSoilModal(false)} 
-                                class="bg-red-200 hover:bg-red-300 text-red-800 font-bold w-8 h-8 rounded-full flex items-center justify-center transition duration-200 focus:outline-none"
-                                title="Tắt thông báo"
-                            >
-                                ✕
-                            </button>
+                            <button onClick={() => setShowSoilModal(false)} class="bg-red-200 hover:bg-red-300 text-red-800 font-bold w-8 h-8 rounded-full flex items-center justify-center">✕</button>
                         </div>
                     )}
 
                     <div class="flex justify-between items-center border-b-2 border-green-700 pb-4 mb-6">
                         <h1 class="text-xl md:text-2xl font-bold text-gray-800">HỆ THỐNG GIÁM SÁT VƯỜN THÔNG MINH</h1>
                         <div class="flex items-center space-x-3">
-                            <span class="bg-green-100 text-green-800 px-3 py-1 rounded-full text-sm font-bold">
-                                Trạng thái: Kết nối Live
+                            <span class="bg-green-100 text-green-800 px-3 py-1 rounded-full text-sm font-bold">Quyền: {userRole}</span>
+                            <button onClick={handleLogout} class="bg-red-500 text-white px-3 py-1 rounded-md text-sm hover:bg-red-600">Đăng xuất</button>
+                        </div>
+                    </div>
+
+                    <div class="bg-white p-4 mb-6 rounded-xl shadow border border-gray-200 flex items-center justify-between flex-wrap gap-3">
+                        <div class="flex items-center space-x-4">
+                            <span class="text-lg font-semibold text-gray-700">💡 ĐÈN VƯỜN</span>
+                            <span class={`text-sm font-bold px-2.5 py-0.5 rounded ${ledState ? 'bg-green-100 text-green-800' : 'bg-gray-100 text-gray-800'}`}>
+                                {ledState ? 'ĐANG BẬT' : 'ĐÃ TẮT'}
                             </span>
-                            <button onClick={handleLogout} class="bg-red-500 text-white px-3 py-1 rounded-md text-sm hover:bg-red-600 transition">Đăng xuất</button>
+                            <span class={`text-xs font-medium px-2 py-0.5 rounded ${manualControl ? 'bg-amber-100 text-amber-800' : 'bg-blue-100 text-blue-800'}`}>
+                                {manualControl ? 'Chế độ: Bằng tay' : 'Chế độ: Tự động'}
+                            </span>
+                        </div>
+                        <div class="flex items-center space-x-3">
+                            {userRole === 'Guest' ? (
+                                <span class="text-xs text-red-500 font-medium italic">🔒 Khách chỉ được xem thông số, không có quyền điều khiển</span>
+                            ) : (
+                                <div class="flex items-center space-x-2">
+                                    <button
+                                        onClick={toggleLed}
+                                        disabled={sending}
+                                        className={`px-4 py-2 rounded-lg font-bold text-white transition duration-200 text-sm ${
+                                            sending ? 'bg-gray-400 cursor-not-allowed' :
+                                            ledState ? 'bg-red-500 hover:bg-red-600' : 'bg-green-600 hover:bg-green-700'
+                                        }`}
+                                    >
+                                        {sending ? '⏳ Đang gửi...' : ledState ? '🔴 TẮT ĐÈN' : '🟢 BẬT ĐÈN'}
+                                    </button>
+                                    {manualControl && (
+                                        <button
+                                            onClick={setAutoMode}
+                                            disabled={sending}
+                                            class={`font-bold px-4 py-2 rounded-lg text-sm transition text-white ${sending ? 'bg-gray-400 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700'}`}
+                                        >
+                                            🔄 VỀ AUTO
+                                        </button>
+                                    )}
+                                </div>
+                            )}
+                            {rpcResult && (
+                                <span className={`text-xs font-bold ${rpcResult.includes('✅') || rpcResult.includes('🔄') ? 'text-green-600' : rpcResult.includes('⏳') ? 'text-blue-500' : 'text-red-500'}`}>
+                                    {rpcResult}
+                                </span>
+                            )}
                         </div>
                     </div>
 
                     <h3 class="text-lg font-semibold text-gray-700 mb-3">📊 Thông số cảm biến thời gian thực</h3>
-                    <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+                    <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
                         <div class="p-4 bg-yellow-50 rounded-lg border border-yellow-200 text-center shadow-sm">
                             <h4 class="text-sm text-gray-500 font-medium">🌡️ Nhiệt độ</h4>
                             <h2 class="text-xl font-bold text-yellow-700 mt-1">{telemetry.temperature} °C</h2>
                         </div>
                         <div class="p-4 bg-blue-50 rounded-lg border border-blue-200 text-center shadow-sm">
-                            <h4 class="text-sm text-gray-500 font-medium">💧 Độ ẩm không khí</h4>
+                            <h4 class="text-sm text-gray-500 font-medium">💧 Độ ẩm KK</h4>
                             <h2 class="text-xl font-bold text-blue-700 mt-1">{telemetry.humidity} %</h2>
                         </div>
-                        
                         <div class={`p-4 rounded-lg border text-center shadow-sm transition duration-300 ${ledState ? 'bg-green-100 border-green-300' : 'bg-purple-50 border-purple-200'}`}>
                             <h4 class="text-sm text-gray-500 font-medium">☀️ Ánh sáng</h4>
-                            <h2 class={`text-xl font-bold mt-1 ${ledState ? 'text-green-700' : 'text-purple-700'}`}>
-                                {telemetry.lux} Lux
-                            </h2>
+                            <h2 class={`text-xl font-bold mt-1 ${ledState ? 'text-green-700' : 'text-purple-700'}`}>{telemetry.lux} Lux</h2>
                             <span class={`text-xs font-bold block mt-1 ${ledState ? 'text-green-600 animate-pulse' : 'text-purple-500'}`}>
                                 {ledState ? "💡 ĐÈN BẬT" : "💤 ĐÈN TẮT"}
                             </span>
                         </div>
-
                         <div class="p-4 bg-amber-50 rounded-lg border border-amber-200 text-center shadow-sm">
                             <h4 class="text-sm text-gray-500 font-medium">🌱 Độ ẩm đất</h4>
                             <h2 class="text-xl font-bold text-amber-700 mt-1">{telemetry.soilPercent} %</h2>
