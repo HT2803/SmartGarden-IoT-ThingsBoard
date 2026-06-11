@@ -14,6 +14,8 @@ const char* access_token = "HWNXTu7adTvVtFd5TjO6";
 #define SOIL_PIN 32
 #define DHT_PIN 4
 #define LED_PIN 2
+#define PUMP_PIN 18
+#define MIST_PIN 27
 
 #define DHTTYPE DHT22
 DHT dht(DHT_PIN, DHTTYPE);
@@ -23,35 +25,51 @@ PubSubClient client(espClient);
 
 unsigned long lastSendTime = 0;
 const unsigned long interval = 5000;
-const float LUX_THRESHOLD = 50.0;
-bool ledState = false;
+const int LIGHT_THRESHOLD = 2500;
 
-bool manualControl = false;
-unsigned long manualTimeout = 0;
-const unsigned long MANUAL_TIMEOUT = 30000;
+bool ledState  = false;
+bool pumpState = false;
+bool mistState = false;
+bool autoMode  = true;
+
+float g_temperature = NAN;
+float g_humidity    = NAN;
+int   g_lightRaw    = 0;
+int   g_soilRaw     = 0;
 
 void setup_wifi() {
   delay(10);
-  Serial.println();
-  Serial.print("Ket noi WiFi: ");
-  Serial.println(ssid);
-
   WiFi.begin(ssid, pass);
-  
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 40) {
     delay(500);
-    Serial.print(".");
     attempts++;
   }
-  
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\n✅ WiFi OK!");
-    Serial.print("IP: ");
-    Serial.println(WiFi.localIP());
-  } else {
-    Serial.println("\n❌ WiFi FAIL!");
+}
+
+void sendTelemetryNow() {
+  StaticJsonDocument<256> jsonDoc;
+  if (!isnan(g_humidity) && !isnan(g_temperature)) {
+    jsonDoc["temperature"] = g_temperature;
+    jsonDoc["humidity"]    = g_humidity;
   }
+  jsonDoc["lightRaw"]  = g_lightRaw;
+  jsonDoc["soilRaw"]   = g_soilRaw;
+  jsonDoc["ledState"]  = ledState  ? 1 : 0;
+  jsonDoc["pumpState"] = pumpState ? 1 : 0;
+  jsonDoc["mistState"] = mistState ? 1 : 0;
+  jsonDoc["autoState"] = autoMode  ? 1 : 0;
+
+  char telemetryPayload[256];
+  serializeJson(jsonDoc, telemetryPayload);
+  if (client.connected()) {
+    client.publish("v1/devices/me/telemetry", telemetryPayload);
+  }
+}
+
+bool parseParamsBool(JsonVariant params) {
+  if (params.is<bool>()) return params.as<bool>();
+  return params["state"] | false;
 }
 
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
@@ -60,68 +78,54 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   memcpy(jsonStr, payload, length);
   jsonStr[length] = '\0';
 
-  Serial.print("📩 Nhận lệnh RPC từ topic [");
-  Serial.print(topic);
-  Serial.print("]: ");
+  Serial.print("📩 Lệnh nhận: ");
   Serial.println(jsonStr);
 
   StaticJsonDocument<200> doc;
   DeserializationError error = deserializeJson(doc, jsonStr);
-  if (error) {
-    Serial.println("❌ Lỗi parse JSON");
-    return;
-  }
+  if (error) return;
 
   const char* method = doc["method"];
   if (method == nullptr) return;
 
-  String topicStr = String(topic);
-  int lastSlash = topicStr.lastIndexOf('/');
+  String topicStr  = String(topic);
+  int lastSlash    = topicStr.lastIndexOf('/');
   String requestId = (lastSlash > 0) ? topicStr.substring(lastSlash + 1) : "0";
 
   if (strcmp(method, "setLedState") == 0) {
-    bool state = doc["params"]["state"] | false;
-    ledState = state;
-    digitalWrite(LED_PIN, ledState ? HIGH : LOW);
-    manualControl = true;
-    manualTimeout = millis();
-
-    String respTopic = "v1/devices/me/rpc/response/" + requestId;
-    StaticJsonDocument<64> respDoc;
-    respDoc["result"] = "ok";
-    char respBuffer[64];
-    serializeJson(respDoc, respBuffer);
-    client.publish(respTopic.c_str(), respBuffer);
-
-    Serial.print("💡 LED đã ");
-    Serial.println(ledState ? "BẬT (thủ công)" : "TẮT (thủ công)");
+    ledState = parseParamsBool(doc["params"]);
+    digitalWrite(LED_PIN, ledState ? HIGH : LOW);   // active HIGH
+    autoMode = false;
   }
-  else if (strcmp(method, "setLedMode") == 0) {
-    const char* mode = doc["params"]["mode"];
-    if (mode && strcmp(mode, "auto") == 0) {
-      manualControl = false;
-      Serial.println("🔄 Chuyển sang chế độ TỰ ĐỘNG");
-      String respTopic = "v1/devices/me/rpc/response/" + requestId;
-      client.publish(respTopic.c_str(), "{\"result\":\"auto mode activated\"}");
-    }
+  else if (strcmp(method, "setPumpState") == 0) {
+    pumpState = parseParamsBool(doc["params"]);
+    digitalWrite(PUMP_PIN, pumpState ? HIGH : LOW); // ✅ đổi: active HIGH
+    autoMode = false;
   }
+  else if (strcmp(method, "setMistState") == 0) {
+    mistState = parseParamsBool(doc["params"]);
+    digitalWrite(MIST_PIN, mistState ? HIGH : LOW); // ✅ đổi: active HIGH
+    autoMode = false;
+  }
+  else if (strcmp(method, "setAutoState") == 0) {
+    autoMode = parseParamsBool(doc["params"]);
+    Serial.print("🔄 Chế độ tự động: ");
+    Serial.println(autoMode ? "BẬT" : "TẮT");
+  }
+
+  sendTelemetryNow();
+
+  String respTopic = "v1/devices/me/rpc/response/" + requestId;
+  client.publish(respTopic.c_str(), "{\"result\":\"ok\"}");
 }
 
 void reconnectMQTT() {
   while (!client.connected()) {
-    Serial.print("MQTT connecting... ");
-    
     String clientId = "ESP32_";
     clientId += String(random(0xffff), HEX);
-    
     if (client.connect(clientId.c_str(), access_token, "")) {
-      Serial.println("✅ CONNECTED!");
       client.subscribe("v1/devices/me/rpc/request/+");
-      Serial.println("📡 Đã subscribe RPC");
     } else {
-      Serial.print("❌ FAILED (rc=");
-      Serial.print(client.state());
-      Serial.println(")");
       delay(5000);
     }
   }
@@ -129,29 +133,19 @@ void reconnectMQTT() {
 
 void setup() {
   Serial.begin(115200);
-  randomSeed(analogRead(0));
-  
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
-  
-  dht.begin();
-  Serial.println("DHT22 da san sang!");
-  delay(1000);
 
+  pinMode(LED_PIN,  OUTPUT);
+  pinMode(PUMP_PIN, OUTPUT);
+  pinMode(MIST_PIN, OUTPUT);
+
+  digitalWrite(LED_PIN,  LOW);
+  digitalWrite(PUMP_PIN, LOW);  // ✅ đổi: active HIGH → LOW = tắt khi khởi động
+  digitalWrite(MIST_PIN, LOW);  // ✅ đổi: active HIGH → LOW = tắt khi khởi động
+
+  dht.begin();
   setup_wifi();
   client.setServer(thingsboard_server, mqtt_port);
   client.setCallback(mqttCallback);
-  
-  Serial.println("Test LED tich hop...");
-  digitalWrite(LED_PIN, HIGH);
-  delay(300);
-  digitalWrite(LED_PIN, LOW);
-  delay(300);
-  digitalWrite(LED_PIN, HIGH);
-  delay(300);
-  digitalWrite(LED_PIN, LOW);
-  
-  Serial.println("--- HE THONG VUON THONG MINH (co dieu khien tu xa) ---\n");
 }
 
 void loop() {
@@ -160,114 +154,53 @@ void loop() {
   }
   client.loop();
 
-  int lightRaw = analogRead(LDR_PIN);
-  float lux = 0.0;
+  g_lightRaw    = analogRead(LDR_PIN);
+  g_soilRaw     = analogRead(SOIL_PIN);
+  g_humidity    = dht.readHumidity();
+  g_temperature = dht.readTemperature();
 
-  if (lightRaw >= 4050) {
-    lux = 0.0;
-  } 
-  else if (lightRaw <= 50) {
-    lux = 500.0;
-  } 
-  else {
-    float voltage = lightRaw * (3.3 / 4095.0);
-    if (voltage < 0.01) voltage = 0.01;
-    float ldrResistance = (3.3 - voltage) * 10000 / voltage;
-    if (ldrResistance > 0) {
-      lux = pow(500000 / ldrResistance, 1.4);
+  if (autoMode) {
+    // --- Đèn ---
+    if (g_lightRaw > LIGHT_THRESHOLD) {
+      if (!ledState) { ledState = true;  digitalWrite(LED_PIN, HIGH); }
     } else {
-      lux = 500.0;
+      if (ledState)  { ledState = false; digitalWrite(LED_PIN, LOW);  }
     }
-  }
 
-  if (!manualControl) {
-    if (lux < LUX_THRESHOLD) {
-      ledState = true;
-      digitalWrite(LED_PIN, HIGH);
-    } else {
-      ledState = false;
-      digitalWrite(LED_PIN, LOW);
+    // --- Bơm (hysteresis 2500–3000) ---
+    if (g_soilRaw > 3000) {
+      if (!pumpState) { pumpState = true;  digitalWrite(PUMP_PIN, HIGH); } // ✅ đổi
+    } else if (g_soilRaw < 2500) {
+      if (pumpState)  { pumpState = false; digitalWrite(PUMP_PIN, LOW);  } // ✅ đổi
     }
-  }
-  else if (manualControl && (millis() - manualTimeout > MANUAL_TIMEOUT)) {
-    manualControl = false;
-    Serial.println("⏰ Hết thời gian chờ, quay lại chế độ tự động");
+    // Vùng 2500–3000: giữ nguyên
+
+    // --- Phun sương ---
+    bool newMist = (!isnan(g_temperature) && g_temperature > 32.0);
+    if (newMist != mistState) {
+      mistState = newMist;
+      digitalWrite(MIST_PIN, mistState ? HIGH : LOW); // ✅ đổi
+    }
   }
 
   unsigned long currentMillis = millis();
   if (currentMillis - lastSendTime >= interval) {
     lastSendTime = currentMillis;
-
-    float humidityAir = dht.readHumidity();
-    float temperature = dht.readTemperature();
-
-    int soilRaw = analogRead(SOIL_PIN);
-    float soilPercent = 100.0 - (soilRaw / 4095.0) * 100.0;
-
-    StaticJsonDocument<256> jsonDoc;
-    
-    if (!isnan(humidityAir) && !isnan(temperature)) {
-      jsonDoc["temperature"] = temperature;
-      jsonDoc["humidity"] = humidityAir;
-    }
-    
-    jsonDoc["lightRaw"] = lightRaw;
-    jsonDoc["lux"] = lux;
-    jsonDoc["soilRaw"] = soilRaw;
-    jsonDoc["soilPercent"] = soilPercent;
-    jsonDoc["ledState"] = ledState ? 1 : 0;
-    jsonDoc["manualControl"] = manualControl ? 1 : 0;
-
-    char telemetryPayload[256];
-    serializeJson(jsonDoc, telemetryPayload);
-
-    if (client.connected()) {
-      if (client.publish("v1/devices/me/telemetry", telemetryPayload)) {
-        Serial.println("✅ DATA SENT!");
-      } else {
-        Serial.println("❌ PUBLISH FAILED!");
-      }
-    }
+    sendTelemetryNow();
 
     Serial.println("----------- THONG SO -----------");
-    Serial.print("💡 Anh sang: ");
-    Serial.print(lux);
-    Serial.println(" Lux");
-    
-    if (!isnan(temperature) && !isnan(humidityAir)) {
-      Serial.print("🌡️  Nhiet do: ");
-      Serial.print(temperature);
-      Serial.println(" °C");
-      Serial.print("💧 Do am KK: ");
-      Serial.print(humidityAir);
-      Serial.println(" %");
-    } else {
-      Serial.println("⚠️  DHT22: Loi doc du lieu!");
+    Serial.print("💡 Anh sang  : "); Serial.println(g_lightRaw);
+    if (!isnan(g_temperature)) {
+      Serial.print("🌡️  Nhiet do  : "); Serial.print(g_temperature); Serial.println(" °C");
+      Serial.print("💧 Do am KK  : "); Serial.print(g_humidity);    Serial.println(" %");
     }
-    
-    Serial.print("🌱 Do am dat: ");
-    Serial.print(soilPercent);
-    Serial.println(" %");
-    
-    Serial.print("💡 LED: ");
-    Serial.print(ledState ? "BAT" : "TAT");
-    if (manualControl) {
-      Serial.print(" (Điều khiển tay)");
-    } else {
-      Serial.print(" (Tự động)");
-    }
-    Serial.println();
-    
-    if (soilPercent < 30) {
-      Serial.println("⚠️  CANH BAO: DAT DANG KHO! CAN TUOI NUOC!");
-    }
-    
-    if (soilRaw > 3500) {
-      Serial.println("🚨 BAO DONG: DAT RAT KHO (SoilRaw > 3500)!");
-    }
-    
+    Serial.print("🌱 Do am dat : "); Serial.println(g_soilRaw);
+    Serial.print("💡 ĐÈN       : "); Serial.println(ledState  ? "BAT" : "TAT");
+    Serial.print("🔌 MÁY BƠM   : "); Serial.println(pumpState ? "BAT" : "TAT");
+    Serial.print("💨 PHUN SUONG: "); Serial.println(mistState ? "BAT" : "TAT");
+    Serial.println(autoMode ? "Che do: TU DONG" : "Che do: TAY");
     Serial.println("--------------------------------\n");
   }
-  
+
   delay(100);
 }
